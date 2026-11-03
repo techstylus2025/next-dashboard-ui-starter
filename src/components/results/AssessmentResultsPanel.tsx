@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import {
   createMidTermReports,
   createMockReports,
@@ -249,6 +250,7 @@ export default function AssessmentResultsPanel({
   const [filterClass, setFilterClass] = useState("");
   const [filterYear, setFilterYear] = useState("");
   const [filterTerm, setFilterTerm] = useState("");
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [exportingMock, setExportingMock] = useState<string | null>(null);
 
   const filtered = useMemo(
@@ -455,7 +457,22 @@ export default function AssessmentResultsPanel({
         </div>
       ) : null}
 
-      <div className="grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:grid-cols-3">
+      <div className="flex justify-end xl:hidden">
+        <button
+          type="button"
+          onClick={() => setFiltersOpen((isOpen) => !isOpen)}
+          aria-expanded={filtersOpen}
+          aria-controls="assessment-result-filters"
+          className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium text-slate-700 shadow-sm"
+        >
+          <Image src="/filter.svg" alt="" width={16} height={16} />
+          Filters
+        </button>
+      </div>
+      <div
+        id="assessment-result-filters"
+        className={`${filtersOpen ? "grid" : "hidden"} gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:grid-cols-3 xl:grid`}
+      >
         <label className="text-sm font-medium text-slate-700">
           Class
           <select value={filterClass} onChange={(event) => setFilterClass(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5">

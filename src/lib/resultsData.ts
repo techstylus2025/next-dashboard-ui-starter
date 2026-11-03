@@ -424,6 +424,14 @@ export async function loadResultsPageData(
     select: { level: true, minScore: true, maxScore: true, grade: true, remark: true },
   });
 
+  const ctxForEdit = {
+    isAdmin,
+    supervisedClassIds,
+    taughtKeys: new Set(
+      assignedSubjects.map((a) => `${a.classId}:${a.subjectId}`)
+    ),
+  };
+
   const assessments: AssessmentReportRow[] = rawAssessments.map((report) => {
     const subjects = [
       ...report.class.grade.subjects,
@@ -518,14 +526,6 @@ export async function loadResultsPageData(
   });
 
   const schoolSettings = await db.schoolSetting.findFirst();
-
-  const ctxForEdit = {
-    isAdmin,
-    supervisedClassIds,
-    taughtKeys: new Set(
-      assignedSubjects.map((a) => `${a.classId}:${a.subjectId}`)
-    ),
-  };
 
   const reports: TermlyReportRow[] = rawReports.map((r) => {
     const scaleForClass = gradingScaleEntries.filter(
