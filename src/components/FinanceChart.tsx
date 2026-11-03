@@ -26,7 +26,7 @@ const FinanceChart = ({ data }: { data: FinanceChartPoint[] }) => {
         <Image src="/moreDark.png" alt="" width={20} height={20} />
       </div>
       <div className="h-72 w-full min-w-0">
-        <ResponsiveContainer width="100%" height="100%">
+        <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 800, height: 288 }}>
           <LineChart
             data={data}
             margin={{

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { clerkClient } from "@clerk/nextjs/server";
 import prisma from "@/lib/prisma";
 import { createSession } from "@/lib/auth";
+import { upsertCanonicalUser } from "@/lib/userSync";
 
 export async function POST(request: Request) {
   try {
@@ -56,7 +57,7 @@ export async function POST(request: Request) {
 
     const existing = await prisma.user.findUnique({ where: { id: userId } });
     const role = metadataRole || existing?.role || "STUDENT";
-    const user = await prisma.user.upsert({
+    const user = await upsertCanonicalUser({
       where: { id: userId },
       update: { username, email, role },
       create: { id: userId, username, email, password: null, role },

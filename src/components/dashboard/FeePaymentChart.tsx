@@ -12,7 +12,7 @@ export default function FeePaymentChart({ data }: { data: { className: string; p
 
   return (
     <div className="h-80 w-full min-w-0">
-      <ResponsiveContainer width="100%" height="100%">
+      <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 800, height: 320 }}>
         <BarChart data={chartData} margin={{ top: 20, right: 20, left: 0, bottom: 5 }}>
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis dataKey="name" />

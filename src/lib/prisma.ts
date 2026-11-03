@@ -1,13 +1,14 @@
 import { Pool } from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@prisma/client";
+import { normalizeDatabaseUrl } from "./databaseUrl";
 
 const prismaClientSingleton = (): PrismaClient => {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
     throw new Error("DATABASE_URL environment variable not set");
   }
-  const pool = new Pool({ connectionString });
+  const pool = new Pool({ connectionString: normalizeDatabaseUrl(connectionString) });
   const adapter = new PrismaPg(pool);
   // Cast so TS sees all generated models (adapter constructor narrows the type)
   return new PrismaClient({ adapter }) as PrismaClient;

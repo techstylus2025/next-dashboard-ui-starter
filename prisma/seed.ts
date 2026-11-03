@@ -3,13 +3,14 @@ import { hash as argon2Hash } from "argon2";
 import { Pool } from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { Day, PrismaClient, UserSex } from "@prisma/client";
+import { normalizeDatabaseUrl } from "../src/lib/databaseUrl";
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
   throw new Error("DATABASE_URL environment variable not set");
 }
 
-const pool = new Pool({ connectionString });
+const pool = new Pool({ connectionString: normalizeDatabaseUrl(connectionString) });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 

@@ -62,7 +62,7 @@ export default function PerformancePanel({ terms, fallbackClasses }: { terms?: T
             <p className="text-sm text-slate-500">No class data available.</p>
           ) : (
             <div className="h-52">
-              <ResponsiveContainer width="100%" height="100%">
+              <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 800, height: 208 }}>
                 <BarChart data={classPoints.map((c) => ({ name: c.className, value: c.averageScore }))} margin={{ top: 8, right: 8, left: 0, bottom: 8 }}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="name" tick={{ fontSize: 12 }} />

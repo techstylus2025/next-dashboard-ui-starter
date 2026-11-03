@@ -55,7 +55,7 @@ const Performance = ({ report }: { report?: PerformanceReport | null }) => {
       </div>
 
       <div className="relative h-52">
-        <ResponsiveContainer width="100%" height="100%">
+        <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 800, height: 208 }}>
           <PieChart>
             <Pie
               data={chartData}

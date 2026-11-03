@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { clerkClient } from "@clerk/nextjs/server";
 import prisma from "@/lib/prisma";
+import { upsertCanonicalUser } from "@/lib/userSync";
 
 export const runtime = "nodejs";
 
@@ -41,7 +42,7 @@ export async function POST(req: NextRequest) {
     const username = user.username || (user.emailAddresses && user.emailAddresses[0]?.emailAddress) || clerkUserId;
     const email = user.emailAddresses?.[0]?.emailAddress || null;
 
-    await prisma.user.upsert({
+    await upsertCanonicalUser({
       where: { id: clerkUserId },
       update: { username, email, role: role.toUpperCase() },
       create: { id: clerkUserId, username, email, password: null, role: role.toUpperCase() },

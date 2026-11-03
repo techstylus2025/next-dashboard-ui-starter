@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { verifyPassword, createSession, hashPassword } from "@/lib/auth";
 import { createActivityLog } from "@/lib/activityLog";
+import { upsertCanonicalUser } from "@/lib/userSync";
 
 const DEFAULT_AUTH_USERS = [
   { id: "admin", username: "admin", email: "admin@school.local", password: "admin123", role: "ADMIN" },
@@ -42,7 +43,7 @@ async function ensureCanonicalAuthUser(identifier: string) {
   const legacyRole = adminUser ? "ADMIN" : teacherUser ? "TEACHER" : parentUser ? "PARENT" : studentUser ? "STUDENT" : null;
 
   if (legacyUser && legacyRole) {
-    const row = await prisma.user.upsert({
+    const row = await upsertCanonicalUser({
       where: { id: legacyUser.id },
       update: {
         username: legacyUser.username ?? null,
@@ -64,7 +65,7 @@ async function ensureCanonicalAuthUser(identifier: string) {
   if (!defaultUser) return null;
 
   const hashedPassword = await hashPassword(defaultUser.password);
-  return prisma.user.upsert({
+  return upsertCanonicalUser({
     where: { username: defaultUser.username },
     update: {
       email: defaultUser.email,

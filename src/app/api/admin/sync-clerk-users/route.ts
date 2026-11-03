@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { clerkClient } from "@clerk/nextjs/server";
 import prisma from "@/lib/prisma";
 import { getCurrentAuthContext } from "@/lib/auth";
+import { upsertCanonicalUser } from "@/lib/userSync";
 
 export const runtime = "nodejs";
 
@@ -37,7 +38,7 @@ export async function POST() {
       const email = clerkUser.emailAddresses?.[0]?.emailAddress || null;
       const role = metadataRole.toUpperCase();
 
-      await prisma.user.upsert({
+      await upsertCanonicalUser({
         where: { id },
         update: { username, email, role },
         create: { id, username, email, password: null, role },

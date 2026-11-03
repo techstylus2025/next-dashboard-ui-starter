@@ -19,7 +19,7 @@ const AttendanceChart = ({
 }) => {
   return (
     <div className="h-72 w-full min-w-0">
-      <ResponsiveContainer width="100%" height="100%">
+      <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 800, height: 288 }}>
         <BarChart data={data} barSize={20}>
           <CartesianGrid
             strokeDasharray="3 3"

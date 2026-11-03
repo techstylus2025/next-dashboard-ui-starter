@@ -164,7 +164,7 @@ export default function PerformanceComparePanel({ initialTerms }: { initialTerms
           <p className="text-sm text-slate-500">Select a class/subject and at least one term to compare.</p>
         ) : (
           <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 800, height: 256 }}>
               <BarChart data={chartData} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis dataKey="name" />

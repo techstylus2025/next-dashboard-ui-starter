@@ -164,7 +164,11 @@ export default function ChartsSummary({
         </div>
         {studentsByClass.length ? (
           <div style={{ height: Math.max(260, studentsByClass.length * 42) }}>
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer
+              width="100%"
+              height="100%"
+              initialDimension={{ width: 800, height: Math.max(260, studentsByClass.length * 42) }}
+            >
               <BarChart
                 data={studentsByClass}
                 layout="vertical"
@@ -232,7 +236,7 @@ export default function ChartsSummary({
         </div>
         {visibleSubjectRows.length ? (
           <div style={chartHeight}>
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 800, height: 300 }}>
               <BarChart
                 data={visibleSubjectRows}
                 margin={{ top: 8, right: 8, bottom: 26, left: -18 }}
@@ -280,7 +284,11 @@ export default function ChartsSummary({
         </div>
         {visibleTopStudents.length ? (
           <div style={{ height: Math.max(340, visibleTopStudents.length * 38) }}>
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer
+              width="100%"
+              height="100%"
+              initialDimension={{ width: 800, height: Math.max(340, visibleTopStudents.length * 38) }}
+            >
               <BarChart
                 data={visibleTopStudents}
                 layout="vertical"
@@ -321,7 +329,7 @@ export default function ChartsSummary({
         </div>
         {topAttendants.length ? (
           <div style={chartHeight}>
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 800, height: 300 }}>
               <BarChart
                 data={topAttendants}
                 layout="vertical"

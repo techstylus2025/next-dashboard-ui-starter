@@ -22,6 +22,7 @@ import prisma from "./prisma";
 import { clerkClient } from "@clerk/nextjs/server";
 import { getCurrentAuthContext, getServerSession, hashPassword } from "./auth";
 import { teacherCanAccessAssignment } from "./assignmentAccess";
+import { upsertCanonicalUser } from "./userSync";
 
 async function syncCanonicalUser(data: {
   id: string;
@@ -30,7 +31,7 @@ async function syncCanonicalUser(data: {
   password?: string | null;
   role: string;
 }) {
-  await prisma.user.upsert({
+  await upsertCanonicalUser({
     where: { id: data.id },
     update: {
       username: data.username ?? null,
