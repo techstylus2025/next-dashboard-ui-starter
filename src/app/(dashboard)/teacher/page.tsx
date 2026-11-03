@@ -197,7 +197,7 @@ const TeacherPage = async ({ searchParams }: { searchParams: Promise<{ [key: str
             </p>
             <h1 className="text-2xl font-semibold sm:text-3xl">Good {new Date().getHours() < 12 ? "morning" : new Date().getHours() < 18 ? "afternoon" : "evening"}, {teacherFirstName}</h1>
             <p className="mt-2 max-w-xl text-sm text-slate-300 sm:text-base">
-              Your classes, teaching day, and student progress at a glance.
+              Your classes, teaching day, and students progress at a glance.
             </p>
           </div>
           <div className="border-t border-white/15 pt-4 sm:border-l sm:border-t-0 sm:pl-5 sm:pt-0">
