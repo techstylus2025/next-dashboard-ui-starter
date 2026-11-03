@@ -1,0 +1,1198 @@
+"use client";
+
+import {
+  generateTermlyReportsBulk,
+  generateTermlyReportsForSupervisorClass,
+  generateTermlyReportForSingleStudent,
+  getAllStudentsInClass,
+  setClassTermReportPublication,
+} from "@/lib/termlyReportActions";
+import type { ResultsPageContext, TermlyReportRow } from "@/lib/resultsData";
+import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useState, useTransition } from "react";
+import { toast } from "react-toastify";
+import { ClipboardList, GraduationCap, Layers3 } from "lucide-react";
+import ReportEditorCard from "./ReportEditorCard";
+import ReportPreviewModal from "./ReportPreviewModal";
+import ResultsFiltersModal from "./ResultsFiltersModal";
+import ReportSignatureManager from "./ReportSignatureManager";
+import AssessmentResultsPanel from "./AssessmentResultsPanel";
+import ClassScoreLimits from "./ClassScoreLimits";
+import { ITEM_PER_PAGE } from "@/lib/settings";
+
+type SortKey =
+  | "name"
+  | "completion"
+  | "students"
+  | "generated"
+  | "student"
+  | "class"
+  | "percentage";
+
+type ResultsTab = "termly" | "mid-term" | "mock";
+
+function TermSelect({
+  yearId,
+  academicYears,
+  value,
+  onChange,
+}: {
+  yearId: string;
+  academicYears: ResultsPageContext["academicYears"];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const year = academicYears.find((y) => String(y.id) === yearId);
+  return (
+    <select
+      className="rounded-lg border border-slate-300 px-3 py-2.5 w-full text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+    >
+      {year?.terms.map((t) => (
+        <option key={t.termNumber} value={t.termNumber}>
+          Term {t.termNumber}
+        </option>
+      )) ?? (
+        <>
+          <option value="1">Term 1</option>
+          <option value="2">Term 2</option>
+          <option value="3">Term 3</option>
+        </>
+      )}
+    </select>
+  );
+}
+
+export default function ResultsManagement(ctx: ResultsPageContext) {
+  const router = useRouter();
+  const [pending, startTransition] = useTransition();
+  const [tab, setTab] = useState<"reports" | "generate">(
+    ctx.canManageReports ? "generate" : "reports"
+  );
+  const [resultsTab, setResultsTab] = useState<ResultsTab>("termly");
+
+  const [genClassId, setGenClassId] = useState(
+    ctx.classes[0]?.id ? String(ctx.classes[0].id) : ""
+  );
+  const [genYearId, setGenYearId] = useState(
+    ctx.activeYearId ? String(ctx.activeYearId) : ""
+  );
+  const [genTerm, setGenTerm] = useState("1");
+  const [genStudentId, setGenStudentId] = useState("");
+  const [supervisorClassId, setSupervisorClassId] = useState(
+    ctx.supervisedClasses[0]?.id ? String(ctx.supervisedClasses[0].id) : ""
+  );
+
+  const [filterClass, setFilterClass] = useState("");
+  const [filterYear, setFilterYear] = useState("");
+  const [filterTerm, setFilterTerm] = useState("");
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [sortKey, setSortKey] = useState<SortKey>(
+    ctx.isAdmin ? "name" : "student"
+  );
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+  const [viewMode, setViewMode] = useState<"reports" | "class-progress">
+    (ctx.isAdmin ? "class-progress" : "reports");
+  const [previewReport, setPreviewReport] = useState<TermlyReportRow | null>(
+    null
+  );
+  const [classStudents, setClassStudents] = useState<
+    Array<{ id: string; name: string; surname: string }>
+  >([]);
+  const [loadingStudents, setLoadingStudents] = useState(false);
+  const [studentSearch, setStudentSearch] = useState("");
+  const [autoOpenReportFor, setAutoOpenReportFor] = useState<{
+    studentId: string;
+    classId: number;
+    termNumber: number;
+    academicYearId: number;
+  } | null>(null);
+
+  const activeYearLabel = useMemo(() => {
+    const y = ctx.academicYears.find((a) => a.id === ctx.activeYearId);
+    return y?.label ?? "active academic year";
+  }, [ctx.academicYears, ctx.activeYearId]);
+
+  const shouldGroupRecords = ctx.role === "student" || ctx.role === "parent";
+
+  // Filter students for the dropdown based on search
+  const filteredClassStudents = useMemo(() => {
+    if (!studentSearch) return classStudents;
+    const search = studentSearch.toLowerCase();
+    return classStudents.filter(
+      (s) =>
+        s.name.toLowerCase().includes(search) ||
+        s.surname.toLowerCase().includes(search)
+    );
+  }, [classStudents, studentSearch]);
+
+  const filteredReports = useMemo(() => {
+    return ctx.reports.filter((r) => {
+      if (filterClass && String(r.classId) !== filterClass) return false;
+      if (filterYear && String(r.academicYearId) !== filterYear) return false;
+      if (filterTerm && String(r.termNumber) !== filterTerm) return false;
+      if (
+        search &&
+        !r.studentName.toLowerCase().includes(search.toLowerCase())
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [ctx.reports, filterClass, filterYear, filterTerm, search]);
+
+  const groupedReports = useMemo(() => {
+    if (!shouldGroupRecords) return [];
+
+    const years = new Map<
+      string,
+      Map<string, Map<number, TermlyReportRow[]>>
+    >();
+
+    for (const report of filteredReports) {
+      const yearGroup = years.get(report.academicYearLabel) ?? new Map();
+      years.set(report.academicYearLabel, yearGroup);
+
+      const classGroup = yearGroup.get(report.className) ?? new Map();
+      yearGroup.set(report.className, classGroup);
+
+      const termGroup = classGroup.get(report.termNumber) ?? [];
+      classGroup.set(report.termNumber, termGroup);
+
+      termGroup.push(report);
+    }
+
+    return Array.from(years.entries())
+      .map(([academicYearLabel, classMap]) => ({
+        academicYearLabel,
+        classes: Array.from(classMap.entries())
+          .map(([className, termMap]) => ({
+            className,
+            terms: Array.from(termMap.entries())
+              .map(([termNumber, reports]) => ({
+                termNumber,
+                reports,
+              }))
+              .sort((a, b) => a.termNumber - b.termNumber),
+          }))
+          .sort((a, b) => a.className.localeCompare(b.className)),
+      }))
+      .sort((a, b) => b.academicYearLabel.localeCompare(a.academicYearLabel));
+  }, [filteredReports, shouldGroupRecords]);
+
+  const classProgressItems = useMemo(() => {
+    return ctx.classes
+      .filter((cls) => {
+        if (search && !cls.name.toLowerCase().includes(search.toLowerCase())) {
+          return false;
+        }
+        if (filterClass && String(cls.id) !== filterClass) return false;
+        return true;
+      })
+      .map((cls) => {
+        const relevantReports = ctx.reports.filter((report) => {
+          if (report.classId !== cls.id) return false;
+          if (filterYear && String(report.academicYearId) !== filterYear)
+            return false;
+          if (filterTerm && String(report.termNumber) !== filterTerm)
+            return false;
+          return true;
+        });
+        const generated = relevantReports.length;
+        const totalStudents = cls.studentCount || 0;
+        const completion = totalStudents
+          ? Math.round((generated / totalStudents) * 100)
+          : 0;
+        return {
+          classId: cls.id,
+          className: cls.name,
+          totalStudents,
+          generated,
+          completion,
+        };
+      });
+  }, [ctx.classes, ctx.reports, search, filterClass, filterYear, filterTerm]);
+
+  const sortedReports = useMemo(() => {
+    const sorted = [...filteredReports];
+    if (sortKey === "student") {
+      sorted.sort((a, b) => a.studentName.localeCompare(b.studentName));
+    } else if (sortKey === "class") {
+      sorted.sort((a, b) => a.className.localeCompare(b.className));
+    } else if (sortKey === "percentage") {
+      sorted.sort((a, b) => {
+        const aVal = a.overallPercentage ?? 0;
+        const bVal = b.overallPercentage ?? 0;
+        return aVal - bVal;
+      });
+    }
+    if (sortDirection === "desc") sorted.reverse();
+    return sorted;
+  }, [filteredReports, sortKey, sortDirection]);
+
+  const sortedClassProgress = useMemo(() => {
+    const sorted = [...classProgressItems];
+    if (sortKey === "students") {
+      sorted.sort((a, b) => a.totalStudents - b.totalStudents);
+    } else if (sortKey === "generated") {
+      sorted.sort((a, b) => a.generated - b.generated);
+    } else if (sortKey === "completion") {
+      sorted.sort((a, b) => a.completion - b.completion);
+    } else {
+      sorted.sort((a, b) => a.className.localeCompare(b.className));
+    }
+    if (sortDirection === "desc") sorted.reverse();
+    return sorted;
+  }, [classProgressItems, sortKey, sortDirection]);
+
+  const paginatedReports = useMemo(() => {
+    return sortedReports.slice(
+      (page - 1) * ITEM_PER_PAGE,
+      page * ITEM_PER_PAGE
+    );
+  }, [sortedReports, page]);
+
+  const paginatedClassReports = useMemo(() => {
+    const classes = new Map<number, { className: string; reports: TermlyReportRow[] }>();
+    for (const report of paginatedReports) {
+      const classGroup = classes.get(report.classId) ?? {
+        className: report.className,
+        reports: [],
+      };
+      classGroup.reports.push(report);
+      classes.set(report.classId, classGroup);
+    }
+    return Array.from(classes.entries()).map(([classId, classGroup]) => ({
+      classId,
+      ...classGroup,
+    }));
+  }, [paginatedReports]);
+
+  const paginatedClassProgress = useMemo(() => {
+    return sortedClassProgress.slice(
+      (page - 1) * ITEM_PER_PAGE,
+      page * ITEM_PER_PAGE
+    );
+  }, [sortedClassProgress, page]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, filterClass, filterYear, filterTerm, sortKey, sortDirection, viewMode]);
+
+  // Auto-open report after generation
+  useEffect(() => {
+    if (autoOpenReportFor) {
+      const report = ctx.reports.find(
+        (r) =>
+          r.studentId === autoOpenReportFor.studentId &&
+          r.classId === autoOpenReportFor.classId &&
+          r.termNumber === autoOpenReportFor.termNumber &&
+          r.academicYearId === autoOpenReportFor.academicYearId
+      );
+      if (report) {
+        setPreviewReport(report);
+        setTab("reports");
+        setAutoOpenReportFor(null);
+      }
+    }
+  }, [autoOpenReportFor, ctx.reports]);
+
+  useEffect(() => {
+    // Fetch all students for the selected class
+    if (genClassId && ctx.isAdmin) {
+      setLoadingStudents(true);
+      setGenStudentId(""); // Reset student selection when class changes
+      setStudentSearch(""); // Reset search
+
+      void (async () => {
+        try {
+          const students = await getAllStudentsInClass(parseInt(genClassId, 10));
+          setClassStudents(students);
+        } catch (error) {
+          console.error("Failed to load students:", error);
+          toast.error("Failed to load students for this class.");
+        } finally {
+          setLoadingStudents(false);
+        }
+      })();
+    }
+  }, [genClassId, ctx.isAdmin]);
+
+  const refresh = () => router.refresh();
+
+  const parseGenParams = () => {
+    const termNumber = parseInt(genTerm, 10);
+    const academicYearId = genYearId ? parseInt(genYearId, 10) : undefined;
+    if (!termNumber) return null;
+    return { termNumber, academicYearId };
+  };
+
+  const handleGenerateAll = () => {
+    const params = parseGenParams();
+    if (!params) {
+      toast.error("Select term and academic year.");
+      return;
+    }
+    if (
+      !confirm(
+        `Generate termly reports for ALL students in ALL classes for Term ${params.termNumber}?`
+      )
+    ) {
+      return;
+    }
+    startTransition(() => {
+      void (async () => {
+        const res = await generateTermlyReportsBulk({
+          scope: "all",
+          termNumber: params.termNumber,
+          academicYearId: params.academicYearId,
+        });
+        if (res.success) {
+          toast.success(
+            `Created ${res.created ?? 0} report(s) across ${res.classesProcessed ?? 0} class(es).`
+          );
+          refresh();
+          setTab("reports");
+        } else {
+          toast.error(res.error || "Bulk generation failed.");
+        }
+      })();
+    });
+  };
+
+  const handleGenerateAdminClass = () => {
+    const params = parseGenParams();
+    const classId = parseInt(genClassId, 10);
+    if (!params || !classId) {
+      toast.error("Select class and term.");
+      return;
+    }
+    startTransition(() => {
+      void (async () => {
+        const res = await generateTermlyReportsBulk({
+          scope: "class",
+          classId,
+          termNumber: params.termNumber,
+          academicYearId: params.academicYearId,
+        });
+        if (res.success) {
+          toast.success(
+            res.created
+              ? `Created ${res.created} report(s) for the selected class.`
+              : "Reports already exist; dates were synced from the academic calendar."
+          );
+          refresh();
+          setTab("reports");
+        } else {
+          toast.error(res.error || "Generation failed.");
+        }
+      })();
+    });
+  };
+
+  const handleSupervisorGenerateClass = () => {
+    const params = parseGenParams();
+    const classId = parseInt(supervisorClassId, 10);
+    if (!params || !classId) {
+      toast.error("Select your class and term.");
+      return;
+    }
+    startTransition(() => {
+      void (async () => {
+        const res = await generateTermlyReportsForSupervisorClass({
+          classId,
+          termNumber: params.termNumber,
+          academicYearId: params.academicYearId,
+        });
+        if (res.success) {
+          toast.success(
+            res.created
+              ? `Created ${res.created} report(s) for your class.`
+              : "All students already have reports; dates were updated."
+          );
+          refresh();
+          setTab("reports");
+        } else {
+          toast.error(res.error || "Generation failed.");
+        }
+      })();
+    });
+  };
+
+  const handleGenerateSingleStudent = () => {
+    const params = parseGenParams();
+    const classId = parseInt(genClassId, 10);
+    if (!params || !classId || !genStudentId) {
+      toast.error("Select class, student, and term.");
+      return;
+    }
+    startTransition(() => {
+      void (async () => {
+        const res = await generateTermlyReportForSingleStudent({
+          studentId: genStudentId,
+          classId,
+          termNumber: params.termNumber,
+          academicYearId: params.academicYearId,
+        });
+        if (res.success) {
+          if (res.alreadyExists) {
+            toast.info("Report exists. Opening for editing...");
+          } else {
+            toast.success("Report created. Opening for editing...");
+          }
+          
+          // Set which report to auto-open after refresh
+          setAutoOpenReportFor({
+            studentId: genStudentId,
+            classId,
+            termNumber: params.termNumber,
+            academicYearId: params.academicYearId || ctx.activeYearId || 1,
+          });
+          
+          // Refresh to get the latest reports
+          refresh();
+        } else {
+          toast.error(res.error || "Generation failed.");
+        }
+      })();
+    });
+  };
+
+  const handleClassPublication = (
+    classId: number,
+    action: "publish" | "withhold" | "restore"
+  ) => {
+    const academicYearId = Number(filterYear);
+    const termNumber = Number(filterTerm);
+    if (!academicYearId || !termNumber) {
+      toast.error("Select an academic year and term before managing class reports.");
+      return;
+    }
+    if (
+      action === "withhold" &&
+      !confirm("Withhold all reports for this class, year, and term from parents?")
+    ) {
+      return;
+    }
+    startTransition(() => {
+      void (async () => {
+        const res = await setClassTermReportPublication({
+          classId,
+          academicYearId,
+          termNumber,
+          action,
+        });
+        if (res.success) {
+          toast.success(
+            `${res.updated ?? 0} class report(s) updated.`
+          );
+          refresh();
+        } else {
+          toast.error(res.error || "Could not update class report publication.");
+        }
+      })();
+    });
+  };
+
+  const canManageMetaForReport = (report: TermlyReportRow) =>
+    ctx.isAdmin;
+
+  const publishedReportCount = ctx.reports.filter(
+    (report) => report.isPublished && !report.isWithheld
+  ).length;
+  const reportClassCount = new Set(ctx.reports.map((report) => report.classId)).size;
+
+  return (
+    <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-6 p-3 sm:p-5 lg:p-6">
+      <section className="relative isolate overflow-hidden rounded-3xl bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950 px-6 py-8 text-white shadow-xl shadow-slate-900/10 sm:px-8 sm:py-10">
+        <div className="absolute -right-12 -top-16 -z-10 h-64 w-64 rounded-full bg-sky-400/20 blur-3xl" />
+        <div className="absolute -bottom-24 right-1/3 -z-10 h-48 w-48 rounded-full bg-indigo-400/20 blur-3xl" />
+        <div className="flex flex-col justify-between gap-7 lg:flex-row lg:items-end">
+          <div className="max-w-2xl">
+            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.16em] text-sky-100">
+              <ClipboardList className="h-4 w-4" aria-hidden="true" />
+              Academic performance
+            </div>
+            <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Results &amp; reports</h1>
+            <p className="mt-3 max-w-xl text-sm leading-6 text-slate-300 sm:text-base">
+              {ctx.isAdmin
+                ? "Generate, review, and publish term reports with clear oversight of student and class progress."
+                : ctx.canRecordScores
+                  ? "Record subject results and review the reports for students in your assigned classes."
+                  : "View term reports and track academic progress for your student."}
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-3 sm:min-w-[390px] sm:grid-cols-3">
+            <div className="rounded-2xl border border-white/10 bg-white/[0.08] p-4 backdrop-blur">
+              <ClipboardList className="mb-3 h-5 w-5 text-sky-300" aria-hidden="true" />
+              <p className="text-2xl font-bold">{ctx.reports.length}</p>
+              <p className="mt-1 text-xs text-slate-300">Reports available</p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-white/[0.08] p-4 backdrop-blur">
+              <GraduationCap className="mb-3 h-5 w-5 text-emerald-300" aria-hidden="true" />
+              <p className="text-2xl font-bold">{publishedReportCount}</p>
+              <p className="mt-1 text-xs text-slate-300">Published reports</p>
+            </div>
+            <div className="col-span-2 rounded-2xl border border-white/10 bg-white/[0.08] p-4 backdrop-blur sm:col-span-1">
+              <Layers3 className="mb-3 h-5 w-5 text-violet-300" aria-hidden="true" />
+              <p className="text-2xl font-bold">{reportClassCount}</p>
+              <p className="mt-1 text-xs text-slate-300">Classes represented</p>
+            </div>
+          </div>
+        </div>
+        {activeYearLabel ? (
+          <div className="mt-6 inline-flex items-center rounded-full border border-white/15 bg-white/[0.08] px-3 py-1.5 text-xs font-medium text-slate-200">
+            Academic year <span className="mx-2 text-slate-500">·</span>{activeYearLabel}
+          </div>
+        ) : null}
+      </section>
+
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        {ctx.isAdmin && tab === "reports" ? (
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => setViewMode("reports")}
+              className={`rounded-lg px-4 py-2 text-sm font-medium transition-all ${
+                viewMode === "reports"
+                  ? "bg-sky-100 text-sky-700 shadow-sm"
+                  : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+              }`}
+            >
+              Student progress
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("class-progress")}
+              className={`rounded-lg px-4 py-2 text-sm font-medium transition-all ${
+                viewMode === "class-progress"
+                  ? "bg-sky-100 text-sky-700 shadow-sm"
+                  : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+              }`}
+            >
+              Class progress
+            </button>
+          </div>
+        ) : <div />}
+      </div>
+
+      {/* Tabs */}
+      <div className="grid grid-cols-1 gap-2 rounded-xl border border-slate-200 bg-white p-2 shadow-sm sm:grid-cols-3" role="tablist" aria-label="Results type">
+        {([
+          ["termly", "Termly Report"],
+          ["mid-term", "Mid-Term Exams"],
+          ["mock", "Mock Results"],
+        ] as const).map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            role="tab"
+            aria-selected={resultsTab === value}
+            onClick={() => setResultsTab(value)}
+            className={`min-h-11 rounded-lg px-4 py-2.5 text-sm font-semibold transition-colors ${
+              resultsTab === value
+                ? "bg-sky-700 text-white shadow-sm"
+                : "text-slate-700 hover:bg-slate-100"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {resultsTab === "termly" && (ctx.canManageReports || ctx.canRecordScores) && (
+        <div className="flex gap-1 overflow-x-auto border-b-2 border-slate-200">
+          {ctx.canManageReports && (
+            <button
+              type="button"
+              onClick={() => setTab("generate")}
+              className={`px-4 py-3 text-sm font-semibold border-b-2 transition-all ${
+                tab === "generate"
+                  ? "border-sky-600 text-sky-700"
+                  : "border-transparent text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              Generate
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setTab("reports")}
+            className={`px-4 py-3 text-sm font-semibold border-b-2 transition-all ${
+              tab === "reports"
+                ? "border-sky-600 text-sky-700"
+                : "border-transparent text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            Reports
+          </button>
+        </div>
+      )}
+
+      {resultsTab === "termly" && (ctx.isAdmin || ctx.isSupervisor) && (
+        <ReportSignatureManager
+          isAdmin={ctx.isAdmin}
+          supervisedClasses={ctx.supervisedClasses}
+          headteacherSignature={ctx.schoolSettings?.headteacherSignature ?? null}
+        />
+      )}
+
+      {resultsTab === "termly" && ctx.isAdmin && (
+        <ClassScoreLimits classes={ctx.classes} />
+      )}
+
+      {resultsTab === "termly" && tab === "generate" && ctx.canManageReports && (
+        <section className="rounded-2xl border border-white/60 bg-white/95 p-4 sm:p-5 shadow-sm ring-1 ring-slate-200/80 space-y-6">
+          <div>
+            <h2 className="text-base sm:text-lg font-semibold text-slate-900">
+              Generate termly reports
+            </h2>
+            <p className="text-xs sm:text-sm text-slate-500 mt-2">
+              Uses <strong>{activeYearLabel}</strong> when no year is selected.
+              Reopening date = start of the next term in that year.
+            </p>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <label className="flex flex-col gap-2 text-sm">
+              <span className="font-medium text-slate-700">Academic year</span>
+              <select
+                className="rounded-lg border border-slate-300 px-3 py-2.5 text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                value={genYearId}
+                onChange={(e) => setGenYearId(e.target.value)}
+              >
+                <option value="">Active year ({activeYearLabel})</option>
+                {ctx.academicYears.map((y) => (
+                  <option key={y.id} value={y.id}>
+                    {y.label}
+                    {y.id === ctx.activeYearId ? " (active)" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-sm">
+              <span className="font-medium text-slate-700">Term</span>
+              <TermSelect
+                yearId={genYearId || String(ctx.activeYearId ?? "")}
+                academicYears={ctx.academicYears}
+                value={genTerm}
+                onChange={setGenTerm}
+              />
+            </label>
+            {ctx.isAdmin && (
+              <label className="flex flex-col gap-2 text-sm">
+                <span className="font-medium text-slate-700">Class</span>
+                <select
+                  className="rounded-lg border border-slate-300 px-3 py-2.5 text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                  value={genClassId}
+                  onChange={(e) => setGenClassId(e.target.value)}
+                >
+                  <option value="">Select class</option>
+                  {ctx.classes.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+          </div>
+
+          {ctx.isAdmin && (
+            <>
+              <div className="border-t border-slate-200 pt-6">
+                <h3 className="text-sm font-semibold text-slate-900 mb-4">
+                  Generation options
+                </h3>
+                <div className="space-y-3">
+                  <div className="flex flex-col gap-2">
+                    <button
+                      type="button"
+                      disabled={pending}
+                      onClick={handleGenerateAll}
+                      className="w-full rounded-lg bg-gradient-to-r from-slate-700 to-slate-900 px-4 py-3 text-sm font-medium text-white disabled:opacity-50 hover:shadow-lg transition-shadow"
+                    >
+                      Generate for all students (all classes)
+                    </button>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <button
+                      type="button"
+                      disabled={pending || !genClassId}
+                      onClick={handleGenerateAdminClass}
+                      className="w-full rounded-lg bg-gradient-to-r from-sky-600 to-sky-800 px-4 py-3 text-sm font-medium text-white disabled:opacity-50 hover:shadow-lg transition-shadow"
+                    >
+                      Generate for all students in selected class
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {genClassId && classStudents.length > 0 && (
+                <div className="border-t border-slate-200 pt-6">
+                  <h3 className="text-sm font-semibold text-slate-900 mb-2">
+                    Fetch & Fill Individual Student Report
+                  </h3>
+                  <p className="text-xs text-slate-500 mb-4">
+                    Search and select an individual student to create or edit their termly report.
+                  </p>
+                  <div className="flex flex-col gap-3">
+                    <div className="flex flex-col gap-2">
+                      <label className="flex flex-col gap-2 text-sm">
+                        <span className="font-medium text-slate-700">Search student</span>
+                        <input
+                          type="text"
+                          placeholder="Type name to search..."
+                          value={studentSearch}
+                          onChange={(e) => setStudentSearch(e.target.value)}
+                          disabled={loadingStudents}
+                          className="rounded-lg border border-slate-300 px-3 py-2.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                        />
+                      </label>
+                    </div>
+                    <label className="flex flex-col gap-2 text-sm">
+                      <span className="font-medium text-slate-700">
+                        Select student ({filteredClassStudents.length} available)
+                      </span>
+                      <select
+                        className="rounded-lg border border-slate-300 px-3 py-2.5 text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                        value={genStudentId}
+                        onChange={(e) => setGenStudentId(e.target.value)}
+                        disabled={loadingStudents}
+                      >
+                        <option value="">Select a student</option>
+                        {filteredClassStudents.map((student) => (
+                          <option key={student.id} value={student.id}>
+                            {student.surname}, {student.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      disabled={pending || !genStudentId}
+                      onClick={handleGenerateSingleStudent}
+                      className="w-full rounded-lg bg-gradient-to-r from-emerald-600 to-emerald-800 px-4 py-3 text-sm font-medium text-white disabled:opacity-50 hover:shadow-lg transition-shadow"
+                    >
+                      {pending ? "Processing..." : "Generate & Edit Report"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {ctx.isSupervisor && !ctx.isAdmin && (
+            <div className="rounded-xl border border-sky-100 bg-sky-50/50 p-4 space-y-3">
+              <h3 className="text-sm font-semibold text-sky-900">
+                Class supervisor
+              </h3>
+              <label className="flex flex-col gap-1 text-sm max-w-md">
+                Your class
+                <select
+                  className="rounded-lg border border-slate-200 px-3 py-2 bg-white"
+                  value={supervisorClassId}
+                  onChange={(e) => setSupervisorClassId(e.target.value)}
+                >
+                  {ctx.supervisedClasses.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                disabled={pending || !supervisorClassId}
+                onClick={handleSupervisorGenerateClass}
+                className="w-full sm:w-auto rounded-xl bg-gradient-to-r from-sky-600 to-sky-800 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-50"
+              >
+                Generate reports for all students in my class
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
+      {resultsTab === "termly" && (tab === "reports" || !ctx.canManageReports) && (
+        <section className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4">
+          {/* Filter section */}
+          <div className="mb-6">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h3 className="text-sm font-semibold text-slate-900">
+                Filters & search
+              </h3>
+              <ResultsFiltersModal
+                search={search}
+                filterClass={filterClass}
+                filterYear={filterYear}
+                filterTerm={filterTerm}
+                sortKey={sortKey}
+                sortDirection={sortDirection}
+                classes={ctx.classes}
+                academicYears={ctx.academicYears}
+                viewMode={viewMode}
+                onSearchChange={setSearch}
+                onFilterClassChange={setFilterClass}
+                onFilterYearChange={setFilterYear}
+                onFilterTermChange={setFilterTerm}
+                onSortKeyChange={(value) => setSortKey(value as SortKey)}
+                onSortDirectionChange={setSortDirection}
+                onClear={() => {
+                  setSearch("");
+                  setFilterClass("");
+                  setFilterYear("");
+                  setFilterTerm("");
+                  setSortKey(ctx.isAdmin ? "name" : "student");
+                  setSortDirection("asc");
+                }}
+              />
+            </div>
+            <div className="hidden xl:flex xl:flex-wrap xl:items-end xl:gap-3">
+              <div className="flex flex-col gap-1.5 min-w-[120px] flex-1 xl:max-w-[150px]">
+                <label className="text-[11px] font-medium text-slate-700">Search</label>
+                <input
+                  className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                  placeholder={
+                    ctx.isAdmin && viewMode === "class-progress"
+                      ? "Search class..."
+                      : "Search student..."
+                  }
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
+              <div className="flex flex-col gap-1.5 min-w-[100px] flex-1 xl:max-w-[120px]">
+                <label className="text-[11px] font-medium text-slate-700">Class</label>
+                <select
+                  className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                  value={filterClass}
+                  onChange={(e) => setFilterClass(e.target.value)}
+                >
+                  <option value="">All classes</option>
+                  {ctx.classes.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex flex-col gap-1.5 min-w-[90px] flex-1 xl:max-w-[110px]">
+                <label className="text-[11px] font-medium text-slate-700">Year</label>
+                <select
+                  className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                  value={filterYear}
+                  onChange={(e) => setFilterYear(e.target.value)}
+                >
+                  <option value="">All years</option>
+                  {ctx.academicYears.map((y) => (
+                    <option key={y.id} value={y.id}>
+                      {y.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex flex-col gap-1.5 min-w-[85px] flex-1 xl:max-w-[100px]">
+                <label className="text-[11px] font-medium text-slate-700">Term</label>
+                <select
+                  className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                  value={filterTerm}
+                  onChange={(e) => setFilterTerm(e.target.value)}
+                >
+                  <option value="">All terms</option>
+                  <option value="1">Term 1</option>
+                  <option value="2">Term 2</option>
+                  <option value="3">Term 3</option>
+                  <option value="4">Term 4</option>
+                </select>
+              </div>
+              <div className="flex flex-wrap items-end gap-2 xl:flex-nowrap">
+                <div className="flex flex-col gap-1.5 min-w-[100px] flex-1 xl:max-w-[120px]">
+                  <label className="text-[11px] font-medium text-slate-700">Sort by</label>
+                  <select
+                    className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                    value={sortKey}
+                    onChange={(e) => setSortKey(e.target.value as SortKey)}
+                  >
+                    {viewMode === "class-progress" ? (
+                      <>
+                        <option value="name">Class name</option>
+                        <option value="students">Student count</option>
+                        <option value="generated">Reports generated</option>
+                        <option value="completion">Completion %</option>
+                      </>
+                    ) : (
+                      <>
+                        <option value="student">Student</option>
+                        <option value="class">Class</option>
+                        <option value="percentage">Completion %</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+                <div className="flex flex-col gap-1.5 min-w-[90px] flex-1 xl:max-w-[110px]">
+                  <label className="text-[11px] font-medium text-slate-700">Order</label>
+                  <select
+                    className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                    value={sortDirection}
+                    onChange={(e) =>
+                      setSortDirection(e.target.value as "asc" | "desc")
+                    }
+                  >
+                    <option value="asc">Ascending</option>
+                    <option value="desc">Descending</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {ctx.isAdmin && viewMode === "class-progress" ? (
+            <>
+              <p className="mb-3 text-xs text-slate-500">
+                Select a year and term in the filters to publish or withhold reports for a whole class.
+              </p>
+              {paginatedClassProgress.length === 0 ? (
+                <div className="py-12 text-center">
+                  <p className="text-sm text-slate-500">No classes match the current filters.</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="border-b border-slate-200 bg-slate-50">
+                        <th className="px-6 py-3 text-left text-xs font-semibold text-slate-900">
+                          Class
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-semibold text-slate-900">
+                          Students
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-semibold text-slate-900">
+                          Reports generated
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-semibold text-slate-900">
+                          Completion
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-semibold text-slate-900">
+                          Parent access
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200">
+                      {paginatedClassProgress.map((item) => (
+                        <tr key={item.classId} className="hover:bg-slate-50 transition-colors">
+                          <td className="px-6 py-4 text-sm font-medium text-slate-900">
+                            {item.className}
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600">
+                            {item.totalStudents}
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600">
+                            {item.generated}
+                          </td>
+                          <td className="px-6 py-4">
+                            <div className="flex items-center gap-3">
+                              <div className="flex-1 w-32">
+                                <div className="w-full rounded-full bg-slate-200 h-2">
+                                  <div
+                                    className="h-2 rounded-full bg-gradient-to-r from-sky-600 to-sky-800"
+                                    style={{ width: `${item.completion}%` }}
+                                  />
+                                </div>
+                              </div>
+                              <span className="text-xs font-medium text-slate-600">
+                                {item.completion}%
+                              </span>
+                            </div>
+                          </td>
+                          <td className="px-6 py-4">
+                            <div className="flex min-w-[330px] flex-wrap gap-2">
+                              <button
+                                type="button"
+                                disabled={pending || !filterYear || !filterTerm || item.generated === 0}
+                                onClick={() => handleClassPublication(item.classId, "publish")}
+                                className="rounded-md bg-emerald-600 px-2.5 py-1.5 text-xs font-medium text-white disabled:opacity-40"
+                              >
+                                Publish class
+                              </button>
+                              <button
+                                type="button"
+                                disabled={pending || !filterYear || !filterTerm || item.generated === 0}
+                                onClick={() => handleClassPublication(item.classId, "withhold")}
+                                className="rounded-md border border-rose-200 px-2.5 py-1.5 text-xs text-rose-700 disabled:opacity-40"
+                              >
+                                Withhold class
+                              </button>
+                              <button
+                                type="button"
+                                disabled={pending || !filterYear || !filterTerm || item.generated === 0}
+                                onClick={() => handleClassPublication(item.classId, "restore")}
+                                className="rounded-md border border-slate-300 px-2.5 py-1.5 text-xs text-slate-700 disabled:opacity-40"
+                              >
+                                Restore access
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between text-xs text-slate-500 border-t border-slate-200 pt-4">
+                <div className="font-medium">
+                  Showing {paginatedClassProgress.length} of {sortedClassProgress.length} classes
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    disabled={page <= 1}
+                    onClick={() => setPage((prev) => Math.max(prev - 1, 1))}
+                    className="rounded-lg border border-slate-300 px-3 py-1.5 disabled:opacity-50 hover:bg-slate-50"
+                  >
+                    Prev
+                  </button>
+                  <span className="font-medium">
+                    Page {page} of {Math.max(1, Math.ceil(sortedClassProgress.length / ITEM_PER_PAGE))}
+                  </span>
+                  <button
+                    disabled={page >= Math.ceil(sortedClassProgress.length / ITEM_PER_PAGE)}
+                    onClick={() => setPage((prev) => prev + 1)}
+                    className="rounded-lg border border-slate-300 px-3 py-1.5 disabled:opacity-50 hover:bg-slate-50"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            </>
+          ) : filteredReports.length === 0 ? (
+            <div className="py-12 text-center">
+              <p className="text-sm text-slate-500">
+                No termly reports found.
+                {ctx.canManageReports &&
+                  " Open the Generate tab to create them for a class or the whole school."}
+              </p>
+            </div>
+          ) : shouldGroupRecords ? (
+            groupedReports.length === 0 ? (
+              <div className="py-12 text-center">
+                <p className="text-sm text-slate-500">
+                  No termly reports found for this student.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-5">
+                {groupedReports.map((yearGroup) => (
+                  <div key={yearGroup.academicYearLabel} className="space-y-3">
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
+                      <h3 className="text-base font-semibold text-slate-900">
+                        {yearGroup.academicYearLabel}
+                      </h3>
+                    </div>
+                    <div className="space-y-4">
+                      {yearGroup.classes.map((classGroup) => (
+                        <details key={classGroup.className} className="group rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+                          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 [&::-webkit-details-marker]:hidden">
+                            <span className="text-sm font-semibold text-slate-800">{classGroup.className}</span>
+                            <span className="text-xs text-slate-500">{classGroup.terms.reduce((count, term) => count + term.reports.length, 0)} report(s)</span>
+                          </summary>
+                          <div className="mt-3 space-y-4 border-t border-slate-100 pt-3">
+                            {classGroup.terms.map((termGroup) => (
+                              <div key={termGroup.termNumber} className="space-y-2.5">
+                                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                                  <h5 className="text-sm font-semibold text-slate-800">
+                                    Term {termGroup.termNumber}
+                                  </h5>
+                                </div>
+                                <div className="space-y-2">
+                                  {termGroup.reports.map((report) => (
+                                    <ReportEditorCard
+                                      key={report.id}
+                                      report={report}
+                                      canManageMeta={canManageMetaForReport(report)}
+                                      canDelete={ctx.isAdmin}
+                                      canPublish={ctx.isAdmin}
+                                      onPreview={() => setPreviewReport(report)}
+                                    />
+                                  ))}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </details>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+          ) : (
+            <div className="space-y-3">
+              {paginatedClassReports.map((classGroup) => (
+                <details key={classGroup.classId} className="group rounded-xl border border-slate-200 bg-slate-50 p-3 shadow-sm">
+                  <summary className="flex cursor-pointer list-none items-center justify-between gap-3 [&::-webkit-details-marker]:hidden">
+                    <span className="font-semibold text-slate-900">{classGroup.className}</span>
+                    <span className="text-xs text-slate-500">{classGroup.reports.length} report(s)</span>
+                  </summary>
+                  <div className="mt-3 space-y-3 border-t border-slate-200 pt-3">
+                    {classGroup.reports.map((report) => (
+                      <ReportEditorCard
+                        key={report.id}
+                        report={report}
+                        canManageMeta={canManageMetaForReport(report)}
+                        canDelete={ctx.isAdmin}
+                        canPublish={ctx.isAdmin}
+                        onPreview={() => setPreviewReport(report)}
+                      />
+                    ))}
+                  </div>
+                </details>
+              ))}
+            </div>
+          )}
+          {!(ctx.isAdmin && viewMode === "class-progress") && !shouldGroupRecords && filteredReports.length > 0 && (
+            <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between text-xs text-slate-500 border-t border-slate-200 pt-4">
+              <div className="font-medium">
+                Showing {paginatedReports.length} of {filteredReports.length} reports
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  disabled={page <= 1}
+                  onClick={() => setPage((prev) => Math.max(prev - 1, 1))}
+                  className="rounded-lg border border-slate-300 px-3 py-1.5 disabled:opacity-50 hover:bg-slate-50"
+                >
+                  Prev
+                </button>
+                <span className="font-medium">
+                  Page {page} of {Math.max(1, Math.ceil(filteredReports.length / ITEM_PER_PAGE))}
+                </span>
+                <button
+                  disabled={page >= Math.ceil(filteredReports.length / ITEM_PER_PAGE)}
+                  onClick={() => setPage((prev) => prev + 1)}
+                  className="rounded-lg border border-slate-300 px-3 py-1.5 disabled:opacity-50 hover:bg-slate-50"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
+      {resultsTab === "mid-term" && (
+        <AssessmentResultsPanel kind="MID_TERM" ctx={ctx} />
+      )}
+      {resultsTab === "mock" && (
+        <AssessmentResultsPanel kind="MOCK" ctx={ctx} />
+      )}
+
+      {resultsTab === "termly" && previewReport && (
+        <ReportPreviewModal
+          report={previewReport}
+          onClose={() => setPreviewReport(null)}
+        />
+      )}
+    </div>
+  );
+}

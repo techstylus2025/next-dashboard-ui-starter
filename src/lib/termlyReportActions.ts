@@ -1,0 +1,1096 @@
+"use server";
+
+import { getCurrentAuthContext } from "@/lib/auth";
+import { revalidatePath } from "next/cache";
+import prisma from "@/lib/prisma";
+import { PrismaClient } from "@prisma/client";
+import {
+  computeSubjectPercentage,
+  computeJhsOverallGrade,
+  lookupGradeFromScale,
+} from "@/lib/gradingUtils";
+import { getTermVacationAndReopening } from "@/lib/termDates";
+
+const RESULTS_PATH = "/list/results";
+const db = prisma as unknown as PrismaClient;
+
+export async function saveReportSignature(input: {
+  signatureUrl: string;
+  classId?: number;
+}): Promise<{ success: boolean; error: string | null }> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+
+  let signatureUrl: URL;
+  try {
+    signatureUrl = new URL(input.signatureUrl);
+  } catch {
+    return { success: false, error: "Choose a valid uploaded signature image." };
+  }
+
+  if (
+    signatureUrl.protocol !== "https:" ||
+    signatureUrl.hostname !== "res.cloudinary.com" ||
+    !/\/image\/upload\//i.test(signatureUrl.pathname)
+  ) {
+    return { success: false, error: "Signature must be uploaded to the approved image storage." };
+  }
+
+  try {
+    if (ctx.isAdmin) {
+      const settings = await db.schoolSetting.findFirst({ select: { id: true } });
+      if (!settings) {
+        return {
+          success: false,
+          error: "Set up the school details before adding the headteacher signature.",
+        };
+      }
+
+      await db.$transaction([
+        db.schoolSetting.update({
+          where: { id: settings.id },
+          data: { headteacherSignature: input.signatureUrl },
+        }),
+        db.termlyReport.updateMany({
+          data: { headteacherSignature: input.signatureUrl },
+        }),
+      ]);
+    } else if (ctx.role === "teacher") {
+      const classId = Number(input.classId);
+      if (!Number.isInteger(classId) || !ctx.supervisedClassIds.includes(classId)) {
+        return {
+          success: false,
+          error: "You can only set a facilitator signature for a class you supervise.",
+        };
+      }
+      const publishedCount = await db.termlyReport.count({
+        where: { classId, isPublished: true },
+      });
+      if (publishedCount > 0) {
+        return {
+          success: false,
+          error: "A class with published reports cannot change its report signature.",
+        };
+      }
+
+      await db.$transaction([
+        db.class.update({
+          where: { id: classId },
+          data: { supervisorSignature: input.signatureUrl },
+        }),
+        db.termlyReport.updateMany({
+          where: { classId, isPublished: false },
+          data: { supervisorSignature: input.signatureUrl },
+        }),
+      ]);
+    } else {
+      return {
+        success: false,
+        error: "Only administrators and class supervisors can upload report signatures.",
+      };
+    }
+
+    revalidatePath(RESULTS_PATH);
+    return { success: true, error: null };
+  } catch (error) {
+    console.error("Failed to save report signature:", error);
+    return { success: false, error: "Could not apply the signature to the class reports." };
+  }
+}
+
+type AuthCtx = {
+  userId: string;
+  role: string;
+  isAdmin: boolean;
+  isSupervisor: boolean;
+  supervisedClassIds: number[];
+  assignedClassIds: number[];
+  taughtSubjectKeys: Set<string>;
+};
+
+async function getAuthCtx(): Promise<AuthCtx | null> {
+  const session = await getCurrentAuthContext();
+  const userId = session.userId;
+  const role = session.role;
+  if (!userId || !role) return null;
+
+  const isAdmin = role === "admin";
+  let supervisedClassIds: number[] = [];
+  let assignedClassIds: number[] = [];
+  const taughtSubjectKeys = new Set<string>();
+
+  if (role === "teacher") {
+    const [supervised, teacher] = await Promise.all([
+      db.class.findMany({
+        where: { supervisorId: userId },
+        select: { id: true },
+      }),
+      db.teacher.findUnique({
+        where: { id: userId },
+        select: {
+          assignedClasses: {
+            select: {
+              id: true,
+              gradeId: true,
+              grade: { select: { subjects: { select: { id: true, gradeId: true } } } },
+              subjects: { select: { id: true, gradeId: true } },
+              lessons: { select: { subject: { select: { id: true, gradeId: true } } } },
+            },
+          },
+          subjects: { select: { id: true } },
+        },
+      }),
+    ]);
+    supervisedClassIds = supervised.map((c) => c.id);
+    assignedClassIds = teacher?.assignedClasses.map((cls) => cls.id) ?? [];
+    const teacherSubjectIds = new Set(
+      teacher?.subjects.map((subject) => subject.id) ?? []
+    );
+    for (const cls of teacher?.assignedClasses ?? []) {
+      const subjects = [
+        ...cls.grade.subjects,
+        ...cls.subjects,
+        ...cls.lessons.map((lesson) => lesson.subject),
+      ];
+      for (const subject of subjects) {
+        if (subject.gradeId === cls.gradeId && teacherSubjectIds.has(subject.id)) {
+          taughtSubjectKeys.add(`${cls.id}:${subject.id}`);
+        }
+      }
+    }
+    const supervisorClasses =
+      supervisedClassIds.length > 0
+        ? await db.class.findMany({
+            where: { id: { in: supervisedClassIds } },
+            select: {
+              id: true,
+              gradeId: true,
+              grade: { select: { subjects: { select: { id: true, gradeId: true } } } },
+              subjects: { select: { id: true, gradeId: true } },
+              lessons: { select: { subject: { select: { id: true, gradeId: true } } } },
+            },
+          })
+        : [];
+    for (const cls of supervisorClasses) {
+      const subjects = [
+        ...cls.grade.subjects,
+        ...cls.subjects,
+        ...cls.lessons.map((lesson) => lesson.subject),
+      ];
+      for (const subject of subjects) {
+        if (subject.gradeId === cls.gradeId && teacherSubjectIds.has(subject.id)) {
+          taughtSubjectKeys.add(`${cls.id}:${subject.id}`);
+        }
+      }
+    }
+  }
+
+  return {
+    userId,
+    role,
+    isAdmin,
+    isSupervisor: supervisedClassIds.length > 0,
+    supervisedClassIds,
+    assignedClassIds,
+    taughtSubjectKeys,
+  };
+}
+
+function canManageReports(ctx: AuthCtx): boolean {
+  return ctx.isAdmin || ctx.isSupervisor;
+}
+
+function canEditSubjectLine(
+  ctx: AuthCtx,
+  classId: number,
+  subjectId: number
+): boolean {
+  if (ctx.isAdmin) return true;
+  return ctx.taughtSubjectKeys.has(`${classId}:${subjectId}`);
+}
+
+async function loadScaleForClass(classId: number) {
+  const cls = await db.class.findUnique({
+    where: { id: classId },
+    select: { gradingLevel: true },
+  });
+  if (!cls) return { level: "PRIMARY" as const, entries: [] };
+  const entries = await db.gradingScaleEntry.findMany({
+    where: { level: cls.gradingLevel },
+    orderBy: { minScore: "asc" },
+  });
+  return { level: cls.gradingLevel, entries };
+}
+
+async function countAttendanceForTerm(
+  studentId: string,
+  termStart: Date,
+  termEnd: Date
+): Promise<number> {
+  return db.attendance.count({
+    where: {
+      studentId,
+      present: true,
+      isArchived: false,
+      date: { gte: termStart, lte: termEnd },
+    },
+  });
+}
+
+async function recomputeReportTotals(reportId: number) {
+  const report = await db.termlyReport.findUnique({
+    where: { id: reportId },
+    include: {
+      subjectLines: { include: { subject: { select: { isCore: true } } } },
+      class: {
+        select: {
+          gradingLevel: true,
+          classScoreMaximum: true,
+          examScoreMaximum: true,
+        },
+      },
+    },
+  });
+  if (!report) return;
+
+  const entries = await db.gradingScaleEntry.findMany({
+    where: { level: report.class.gradingLevel },
+  });
+
+  let sumPct = 0;
+  let count = 0;
+  for (const line of report.subjectLines) {
+    if (
+      line.lastEditedById !== null ||
+      line.totalMarks > 0 ||
+      line.classScore > 0 ||
+      line.examScore > 0
+    ) {
+      const pct = computeSubjectPercentage(
+        line.classScore,
+        line.examScore,
+        50,
+        report.class.classScoreMaximum,
+        report.class.examScoreMaximum
+      );
+      sumPct += pct;
+      count += 1;
+    }
+  }
+
+  const overallPercentage =
+    count > 0 ? Math.round((sumPct / count) * 100) / 100 : null;
+  const jhsOverallGrade =
+    report.class.gradingLevel === "JHS"
+      ? computeJhsOverallGrade(
+          report.subjectLines.map((line) => ({
+            grade: line.grade,
+            isCore: line.subject.isCore,
+          }))
+        )
+      : null;
+  const lookup =
+    overallPercentage != null
+      ? lookupGradeFromScale(report.class.gradingLevel, overallPercentage, entries)
+      : { grade: null as string | null, remark: null as string | null };
+
+  await db.termlyReport.update({
+    where: { id: reportId },
+    data: {
+      overallPercentage,
+      overallGrade:
+        report.class.gradingLevel === "JHS"
+          ? jhsOverallGrade
+          : lookup.grade === "—"
+            ? null
+            : lookup.grade,
+      overallRemark: lookup.remark || null,
+    },
+  });
+}
+
+async function resolveAcademicYear(academicYearId?: number) {
+  if (academicYearId) {
+    return db.academicYear.findUnique({
+      where: { id: academicYearId },
+      include: {
+        terms: {
+          select: {
+            id: true,
+            termNumber: true,
+            startDate: true,
+            endDate: true,
+          },
+        },
+      },
+    });
+  }
+  return db.academicYear.findFirst({
+    where: { isActive: true, isArchived: false },
+    include: {
+      terms: {
+        select: {
+          id: true,
+          termNumber: true,
+          startDate: true,
+          endDate: true,
+        },
+      },
+    },
+  });
+}
+
+async function getClassSubjectIds(classId: number): Promise<number[]> {
+  const cls = await db.class.findUnique({
+    where: { id: classId },
+    select: {
+      gradeId: true,
+      grade: { select: { subjects: { select: { id: true, gradeId: true } } } },
+      subjects: { select: { id: true, gradeId: true } },
+      lessons: {
+        select: {
+          subject: { select: { id: true, gradeId: true } },
+        },
+      },
+    },
+  });
+  if (!cls) return [];
+
+  const subjects = [
+    ...cls.grade.subjects,
+    ...cls.subjects,
+    ...cls.lessons.map((lesson) => lesson.subject),
+  ];
+  return [...new Set(
+    subjects
+      .filter((subject) => subject.gradeId === cls.gradeId)
+      .map((subject) => subject.id)
+  )];
+}
+
+async function generateReportsForClass(
+  ctx: AuthCtx,
+  classId: number,
+  academicYearId: number,
+  termNumber: number
+): Promise<{ created: number; error?: string }> {
+  const year = await db.academicYear.findUnique({
+    where: { id: academicYearId },
+    include: {
+      terms: {
+        select: {
+          id: true,
+          termNumber: true,
+          startDate: true,
+          endDate: true,
+        },
+      },
+    },
+  });
+  if (!year || year.isArchived) {
+    return { created: 0, error: "Academic year not found or archived." };
+  }
+
+  const term = year.terms.find((t) => t.termNumber === termNumber);
+  if (!term) {
+    return { created: 0, error: "Term not found for this academic year." };
+  }
+
+  let vacationDate: Date;
+  let reopeningDate: Date | null;
+  try {
+    const dates = getTermVacationAndReopening(year.terms, termNumber);
+    vacationDate = dates.vacationDate;
+    reopeningDate = dates.reopeningDate;
+  } catch {
+    vacationDate = term.endDate;
+    reopeningDate = null;
+  }
+
+  const students = await db.student.findMany({
+    where: { classId, isArchived: false },
+    orderBy: [{ surname: "asc" }, { name: "asc" }],
+    select: { id: true },
+  });
+  if (students.length === 0) {
+    return { created: 0, error: "No students in this class." };
+  }
+
+  const subjectIds = await getClassSubjectIds(classId);
+  const totalOnRoll = students.length;
+  let created = 0;
+
+  for (let i = 0; i < students.length; i++) {
+    const student = students[i];
+    const existing = await db.termlyReport.findUnique({
+      where: {
+        studentId_academicYearId_termNumber: {
+          studentId: student.id,
+          academicYearId,
+          termNumber,
+        },
+      },
+    });
+
+    const attendance = await countAttendanceForTerm(
+      student.id,
+      term.startDate,
+      term.endDate
+    );
+
+    if (existing) {
+      if (existing.isPublished) continue;
+      await db.termlyReport.update({
+        where: { id: existing.id },
+        data: {
+          vacationDate,
+          reopeningDate,
+          totalOnRoll,
+          totalAttendance: attendance,
+        },
+      });
+      if (subjectIds.length > 0) {
+        await db.termlyReportSubjectLine.createMany({
+          data: subjectIds.map((subjectId) => ({
+            termlyReportId: existing.id,
+            subjectId,
+            classScore: 0,
+            examScore: 0,
+            totalMarks: 0,
+          })),
+          skipDuplicates: true,
+        });
+      }
+      continue;
+    }
+
+    await db.termlyReport.create({
+      data: {
+        studentId: student.id,
+        classId,
+        academicYearId,
+        termNumber,
+        positionOnRoll: i + 1,
+        totalOnRoll,
+        totalAttendance: attendance,
+        vacationDate,
+        reopeningDate,
+        createdById: ctx.userId,
+        subjectLines: {
+          create: subjectIds.map((subjectId) => ({
+            subjectId,
+            classScore: 0,
+            examScore: 0,
+            totalMarks: 0,
+          })),
+        },
+      },
+    });
+    created += 1;
+  }
+
+  return { created };
+}
+
+export async function createOrInitTermlyReports(input: {
+  classId: number;
+  academicYearId?: number;
+  termNumber: number;
+}): Promise<{ success: boolean; error: string | null; created?: number }> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+  if (!canManageReports(ctx)) {
+    return {
+      success: false,
+      error: "Only administrators or class supervisors can generate reports.",
+    };
+  }
+  if (!ctx.isAdmin && !ctx.supervisedClassIds.includes(input.classId)) {
+    return { success: false, error: "You can only generate reports for your class." };
+  }
+
+  const year = await resolveAcademicYear(input.academicYearId);
+  if (!year) {
+    return { success: false, error: "No active academic year. Set one in Settings." };
+  }
+
+  try {
+    const result = await generateReportsForClass(
+      ctx,
+      input.classId,
+      year.id,
+      input.termNumber
+    );
+    if (result.error && result.created === 0) {
+      return { success: false, error: result.error };
+    }
+    revalidatePath(RESULTS_PATH);
+    return { success: true, error: null, created: result.created };
+  } catch (e) {
+    console.error(e);
+    return { success: false, error: "Could not generate termly reports." };
+  }
+}
+
+/** Admin: all classes, or one class. Uses active academic year when omitted. */
+export async function generateTermlyReportsBulk(input: {
+  scope: "all" | "class";
+  classId?: number;
+  academicYearId?: number;
+  termNumber: number;
+}): Promise<{
+  success: boolean;
+  error: string | null;
+  created?: number;
+  classesProcessed?: number;
+}> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+  if (!ctx.isAdmin) {
+    return { success: false, error: "Only administrators can use bulk generation." };
+  }
+
+  const year = await resolveAcademicYear(input.academicYearId);
+  if (!year) {
+    return { success: false, error: "No active academic year. Set one in Settings." };
+  }
+
+  let classIds: number[] = [];
+  if (input.scope === "all") {
+    const classes = await db.class.findMany({
+      where: { students: { some: {} } },
+      select: { id: true },
+    });
+    classIds = classes.map((c) => c.id);
+  } else {
+    if (!input.classId) {
+      return { success: false, error: "Select a class." };
+    }
+    classIds = [input.classId];
+  }
+
+  if (classIds.length === 0) {
+    return { success: false, error: "No classes with students found." };
+  }
+
+  try {
+    let totalCreated = 0;
+    let classesProcessed = 0;
+    const errors: string[] = [];
+
+    for (const classId of classIds) {
+      const result = await generateReportsForClass(
+        ctx,
+        classId,
+        year.id,
+        input.termNumber
+      );
+      if (result.error && result.created === 0) {
+        errors.push(result.error);
+        continue;
+      }
+      totalCreated += result.created;
+      classesProcessed += 1;
+    }
+
+    revalidatePath(RESULTS_PATH);
+    if (classesProcessed === 0) {
+      return {
+        success: false,
+        error: errors[0] || "No reports were generated.",
+      };
+    }
+    return {
+      success: true,
+      error: null,
+      created: totalCreated,
+      classesProcessed,
+    };
+  } catch (e) {
+    console.error(e);
+    return { success: false, error: "Bulk generation failed." };
+  }
+}
+
+/** Class supervisor: generate for all students in a supervised class. */
+export async function generateTermlyReportsForSupervisorClass(input: {
+  classId: number;
+  academicYearId?: number;
+  termNumber: number;
+}): Promise<{ success: boolean; error: string | null; created?: number }> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+  if (!ctx.isSupervisor) {
+    return { success: false, error: "You are not a class supervisor." };
+  }
+  if (!ctx.supervisedClassIds.includes(input.classId)) {
+    return { success: false, error: "You can only generate reports for your class." };
+  }
+
+  return createOrInitTermlyReports({
+    classId: input.classId,
+    academicYearId: input.academicYearId,
+    termNumber: input.termNumber,
+  });
+}
+
+export async function generateTermlyReportForSingleStudent(input: {
+  studentId: string;
+  classId: number;
+  academicYearId?: number;
+  termNumber: number;
+}): Promise<{
+  success: boolean;
+  error: string | null;
+  created?: boolean;
+  alreadyExists?: boolean;
+}> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+  if (
+    !ctx.isAdmin &&
+    !ctx.supervisedClassIds.includes(input.classId) &&
+    !ctx.assignedClassIds.includes(input.classId)
+  ) {
+    return { success: false, error: "You do not have permission to generate reports for this class." };
+  }
+
+  const year = await resolveAcademicYear(input.academicYearId);
+  if (!year) {
+    return { success: false, error: "No active academic year. Set one in Settings." };
+  }
+
+  try {
+    const term = year.terms.find((t) => t.termNumber === input.termNumber);
+    if (!term) {
+      return { success: false, error: "Term not found for this academic year." };
+    }
+
+    const student = await db.student.findUnique({
+      where: { id: input.studentId },
+      select: { id: true, classId: true },
+    });
+    if (!student || student.classId !== input.classId) {
+      return { success: false, error: "Student not found in this class." };
+    }
+
+    const subjectIds = await getClassSubjectIds(input.classId);
+    const existing = await db.termlyReport.findUnique({
+      where: {
+        studentId_academicYearId_termNumber: {
+          studentId: input.studentId,
+          academicYearId: year.id,
+          termNumber: input.termNumber,
+        },
+      },
+    });
+
+    if (existing) {
+      if (!existing.isPublished && subjectIds.length > 0) {
+        await db.termlyReportSubjectLine.createMany({
+          data: subjectIds.map((subjectId) => ({
+            termlyReportId: existing.id,
+            subjectId,
+            classScore: 0,
+            examScore: 0,
+            totalMarks: 0,
+          })),
+          skipDuplicates: true,
+        });
+      }
+      return { success: true, error: null, alreadyExists: true };
+    }
+
+    let vacationDate: Date;
+    let reopeningDate: Date | null;
+    try {
+      const dates = getTermVacationAndReopening(year.terms, input.termNumber);
+      vacationDate = dates.vacationDate;
+      reopeningDate = dates.reopeningDate;
+    } catch {
+      vacationDate = term.endDate;
+      reopeningDate = null;
+    }
+
+    const attendance = await countAttendanceForTerm(
+      input.studentId,
+      term.startDate,
+      term.endDate
+    );
+
+    // Get position on roll for this student
+    const students = await db.student.findMany({
+      where: { classId: input.classId },
+      orderBy: [{ surname: "asc" }, { name: "asc" }],
+      select: { id: true },
+    });
+    const positionOnRoll = students.findIndex((s) => s.id === input.studentId) + 1;
+    const totalOnRoll = students.length;
+
+    await db.termlyReport.create({
+      data: {
+        studentId: input.studentId,
+        classId: input.classId,
+        academicYearId: year.id,
+        termNumber: input.termNumber,
+        positionOnRoll,
+        totalOnRoll,
+        totalAttendance: attendance,
+        vacationDate,
+        reopeningDate,
+        createdById: ctx.userId,
+        subjectLines: {
+          create: subjectIds.map((subjectId) => ({
+            subjectId,
+            classScore: 0,
+            examScore: 0,
+            totalMarks: 0,
+          })),
+        },
+      },
+    });
+
+    revalidatePath(RESULTS_PATH);
+    return { success: true, error: null, created: true };
+  } catch (e) {
+    console.error(e);
+    return { success: false, error: "Failed to generate report for student." };
+  }
+}
+
+export async function updateTermlyReportMeta(input: {
+  reportId: number;
+  positionOnRoll?: number | null;
+  totalOnRoll?: number;
+  totalAttendance?: number;
+  vacationDate?: string | null;
+  reopeningDate?: string | null;
+  interest?: string | null;
+  conduct?: string | null;
+  resultStatus?: string | null;
+  supervisorRemarks?: string | null;
+  supervisorSignature?: string | null;
+  headteacherRemarks?: string | null;
+  headteacherSignature?: string | null;
+}): Promise<{ success: boolean; error: string | null }> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+
+  const report = await db.termlyReport.findUnique({
+    where: { id: input.reportId },
+    select: { classId: true },
+  });
+  if (!report) return { success: false, error: "Report not found." };
+  if (!ctx.isAdmin) {
+    return {
+      success: false,
+      error: "Only administrators can update report details.",
+    };
+  }
+
+  try {
+    await db.termlyReport.update({
+      where: { id: input.reportId },
+      data: {
+        positionOnRoll: input.positionOnRoll,
+        totalOnRoll: input.totalOnRoll,
+        totalAttendance: input.totalAttendance,
+        vacationDate: input.vacationDate
+          ? new Date(input.vacationDate + "T00:00:00")
+          : input.vacationDate === null
+            ? null
+            : undefined,
+        reopeningDate: input.reopeningDate
+          ? new Date(input.reopeningDate + "T00:00:00")
+          : input.reopeningDate === null
+            ? null
+            : undefined,
+        interest: input.interest ?? undefined,
+        conduct: input.conduct ?? undefined,
+        resultStatus: input.resultStatus ?? undefined,
+        supervisorRemarks: input.supervisorRemarks ?? undefined,
+        supervisorSignature: input.supervisorSignature ?? undefined,
+        headteacherRemarks: input.headteacherRemarks ?? undefined,
+        headteacherSignature: input.headteacherSignature ?? undefined,
+      },
+    });
+    revalidatePath(RESULTS_PATH);
+    return { success: true, error: null };
+  } catch (e) {
+    console.error(e);
+    return { success: false, error: "Could not update report." };
+  }
+}
+
+export async function setTermlyReportPublication(input: {
+  reportId: number;
+  action: "publish" | "withhold" | "restore";
+}): Promise<{ success: boolean; error: string | null }> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+  if (!ctx.isAdmin) {
+    return { success: false, error: "Only administrators can manage report publication." };
+  }
+
+  try {
+    const data =
+      input.action === "publish"
+        ? { isPublished: true, publishedAt: new Date(), isWithheld: false }
+        : input.action === "withhold"
+          ? { isWithheld: true }
+          : { isWithheld: false };
+    const result = await db.termlyReport.updateMany({
+      where: { id: input.reportId },
+      data,
+    });
+    if (result.count === 0) {
+      return { success: false, error: "Report not found." };
+    }
+    revalidatePath(RESULTS_PATH);
+    return { success: true, error: null };
+  } catch (e) {
+    console.error(e);
+    return { success: false, error: "Could not update report publication." };
+  }
+}
+
+export async function setClassTermReportPublication(input: {
+  classId: number;
+  academicYearId: number;
+  termNumber: number;
+  action: "publish" | "withhold" | "restore";
+}): Promise<{ success: boolean; error: string | null; updated?: number }> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+  if (!ctx.isAdmin) {
+    return { success: false, error: "Only administrators can manage report publication." };
+  }
+  if (
+    !Number.isInteger(input.classId) ||
+    input.classId <= 0 ||
+    !Number.isInteger(input.academicYearId) ||
+    input.academicYearId <= 0 ||
+    !Number.isInteger(input.termNumber) ||
+    input.termNumber <= 0
+  ) {
+    return { success: false, error: "Select a class, academic year, and term." };
+  }
+
+  try {
+    const data =
+      input.action === "publish"
+        ? { isPublished: true, publishedAt: new Date(), isWithheld: false }
+        : input.action === "withhold"
+          ? { isWithheld: true }
+          : { isWithheld: false };
+    const result = await db.termlyReport.updateMany({
+      where: {
+        classId: input.classId,
+        academicYearId: input.academicYearId,
+        termNumber: input.termNumber,
+      },
+      data,
+    });
+    revalidatePath(RESULTS_PATH);
+    return { success: true, error: null, updated: result.count };
+  } catch (e) {
+    console.error(e);
+    return { success: false, error: "Could not update class report publication." };
+  }
+}
+
+export async function saveClassTermScoreLimits(input: {
+  classId: number;
+  classScoreMaximum: number;
+  examScoreMaximum: number;
+}): Promise<{ success: boolean; error: string | null }> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+  if (!ctx.isAdmin) {
+    return { success: false, error: "Only administrators can change score limits." };
+  }
+  if (
+    !Number.isInteger(input.classId) ||
+    input.classId <= 0 ||
+    !Number.isInteger(input.classScoreMaximum) ||
+    !Number.isInteger(input.examScoreMaximum) ||
+    input.classScoreMaximum <= 0 ||
+    input.examScoreMaximum <= 0 ||
+    input.classScoreMaximum + input.examScoreMaximum !== 100
+  ) {
+    return {
+      success: false,
+      error: "Class and exam score limits must be positive whole numbers that add up to 100.",
+    };
+  }
+
+  try {
+    const savedScoreMaximums = await db.termlyReportSubjectLine.aggregate({
+      where: { termlyReport: { classId: input.classId } },
+      _max: { classScore: true, examScore: true },
+    });
+    if (
+      (savedScoreMaximums._max.classScore ?? 0) > input.classScoreMaximum ||
+      (savedScoreMaximums._max.examScore ?? 0) > input.examScoreMaximum
+    ) {
+      return {
+        success: false,
+        error: "The new limits cannot be lower than scores already entered for this class.",
+      };
+    }
+    await db.class.update({
+      where: { id: input.classId },
+      data: {
+        classScoreMaximum: input.classScoreMaximum,
+        examScoreMaximum: input.examScoreMaximum,
+      },
+    });
+    revalidatePath(RESULTS_PATH);
+    return { success: true, error: null };
+  } catch (error) {
+    console.error("Failed to save class score limits:", error);
+    return { success: false, error: "Could not save score limits." };
+  }
+}
+
+export async function upsertTermlySubjectLine(input: {
+  reportId: number;
+  subjectId: number;
+  classScore: number;
+  examScore: number;
+}): Promise<{ success: boolean; error: string | null }> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+
+  const report = await db.termlyReport.findUnique({
+    where: { id: input.reportId },
+    select: { id: true, classId: true, isPublished: true },
+  });
+  if (!report) return { success: false, error: "Report not found." };
+
+  if (!canEditSubjectLine(ctx, report.classId, input.subjectId)) {
+    return {
+      success: false,
+      error: "You are not assigned to teach this subject in this class.",
+    };
+  }
+
+  try {
+    const scoreLimit = await db.class.findUnique({
+      where: { id: report.classId },
+      select: {
+        classScoreMaximum: true,
+        examScoreMaximum: true,
+      },
+    });
+    if (!scoreLimit) return { success: false, error: "Class not found." };
+    if (
+      !Number.isInteger(input.classScore) ||
+      !Number.isInteger(input.examScore) ||
+      input.classScore < 0 ||
+      input.examScore < 0 ||
+      input.classScore > scoreLimit.classScoreMaximum ||
+      input.examScore > scoreLimit.examScoreMaximum
+    ) {
+      return {
+        success: false,
+        error: `Scores must be whole numbers between 0 and ${scoreLimit.classScoreMaximum} for class work and 0 and ${scoreLimit.examScoreMaximum} for exams.`,
+      };
+    }
+    if (report.isPublished && !ctx.isAdmin) {
+      return { success: false, error: "Published reports cannot be edited." };
+    }
+
+    const classScore = input.classScore;
+    const examScore = input.examScore;
+    const totalMarks = classScore + examScore;
+    const pct = computeSubjectPercentage(
+      classScore,
+      examScore,
+      50,
+      scoreLimit.classScoreMaximum,
+      scoreLimit.examScoreMaximum
+    );
+    const { level, entries } = await loadScaleForClass(report.classId);
+    const { grade, remark } = lookupGradeFromScale(level, pct, entries);
+
+    await db.termlyReportSubjectLine.upsert({
+      where: {
+        termlyReportId_subjectId: {
+          termlyReportId: input.reportId,
+          subjectId: input.subjectId,
+        },
+      },
+      create: {
+        termlyReportId: input.reportId,
+        subjectId: input.subjectId,
+        classScore,
+        examScore,
+        totalMarks,
+        grade: grade === "—" ? null : grade,
+        remark: remark || null,
+        lastEditedById: ctx.userId,
+      },
+      update: {
+        classScore,
+        examScore,
+        totalMarks,
+        grade: grade === "—" ? null : grade,
+        remark: remark || null,
+        lastEditedById: ctx.userId,
+      },
+    });
+
+    await recomputeReportTotals(input.reportId);
+    revalidatePath(RESULTS_PATH);
+    return { success: true, error: null };
+  } catch (e) {
+    console.error(e);
+    return { success: false, error: "Could not save subject scores." };
+  }
+}
+
+export async function deleteTermlyReport(
+  reportId: number
+): Promise<{ success: boolean; error: string | null }> {
+  const ctx = await getAuthCtx();
+  if (!ctx) return { success: false, error: "Not signed in." };
+  if (!ctx.isAdmin) {
+    return { success: false, error: "Only administrators can delete reports." };
+  }
+
+  try {
+    await db.termlyReport.delete({ where: { id: reportId } });
+    revalidatePath(RESULTS_PATH);
+    return { success: true, error: null };
+  } catch (e) {
+    console.error(e);
+    return { success: false, error: "Could not delete report." };
+  }
+}
+
+/**
+ * Fetch all students in a given class.
+ * Used by admin to see all students (not just those with reports) when filling individual reports.
+ */
+export async function getAllStudentsInClass(
+  classId: number
+): Promise<Array<{ id: string; name: string; surname: string }>> {
+  const ctx = await getAuthCtx();
+  if (!ctx || !ctx.isAdmin) {
+    return [];
+  }
+
+  try {
+    const students = await db.student.findMany({
+      where: { classId },
+      select: { id: true, name: true, surname: true },
+      orderBy: [{ surname: "asc" }, { name: "asc" }],
+    });
+
+    return students;
+  } catch (e) {
+    console.error("Failed to fetch students for class:", e);
+    return [];
+  }
+}

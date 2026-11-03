@@ -1,0 +1,36 @@
+import SettingsManagement from "@/components/settings/SettingsManagement";
+import { loadGradingLevels, loadGradingScaleEntries } from "@/lib/gradingData";
+import { loadSettingsPageData } from "@/lib/settingsData";
+import { getCurrentAuthContext } from "@/lib/auth";
+import { redirect } from "next/navigation";
+
+export default async function SettingsPage() {
+  const { role } = await getCurrentAuthContext();
+
+  if (role !== "admin") {
+    redirect(`/${role || "sign-in"}`);
+  }
+
+  const [settingsData, gradingEntries, gradingLevels] = await Promise.all([
+    loadSettingsPageData(),
+    loadGradingScaleEntries(),
+    loadGradingLevels(),
+  ]);
+
+  const academicYears = settingsData.academicYears;
+
+  return (
+    <div className="flex-1 m-4 mt-0 min-h-[60vh] rounded-2xl bg-lamaSkyLight">
+      <SettingsManagement
+        academicYears={academicYears}
+        gradingEntries={gradingEntries}
+        gradingLevels={gradingLevels}
+        teachers={settingsData.teachers}
+        students={settingsData.students}
+        parents={settingsData.parents}
+        schoolSettings={settingsData.schoolSettings}
+        archivedCounts={settingsData.archivedCounts}
+      />
+    </div>
+  );
+}
